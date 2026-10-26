@@ -21,18 +21,18 @@
   },
   "6.6": {
     "android_version": "android15",
-    "default_sub_level": "66",
+    "default_sub_level": "77",
     "use_lts": false,
     "revisions": {
-      "66": {
-        "asb_date": "2025-02",
-        "default_r": "r20",
+      "77": {
+        "asb_date": "2025-03",
+        "default_r": "r33",
         "supported_r": [
-          "r20",
+          "r33",
           "none"
         ],
-        "commit": "69da9b9a18f51db701705d048c12a70217f120c0",
-        "commit_date": "2026-01-07 15:00:08 +0000"
+        "commit": "aa5f8a9dfe84c9613b6a42ef325e80c4a8bdb768",
+        "commit_date": "2026-01-07 14:59:34 +0000"
       }
     },
     "default_clang": "r510928",
