@@ -1,40 +1,40 @@
 From: github-actions <actions@github.com>
-Date: Sun, 15 Nov 2026 00:09:54 +0000
+Date: Mon, 16 Nov 2026 00:16:30 +0000
 Subject: [PATCH] SUSFS inline hooks for gki-android16-6.12-2025-06
 X-Kernel-Target-Branch: deprecated/android16-6.12-2025-06
 X-Kernel-Target-Commit: 13ff069897df965d9039dca208b2f39dacf81957
 X-SUSFS-Source-Ref: origin/gki-android16-6.12
-X-SUSFS-Source-Commit: 1f59001c081dcb221e2fb0f777835084a8b4f542
+X-SUSFS-Source-Commit: 9b0b13f069673b9b07b713a5c66977de4d62b175
 
 ---
  block/ioprio.c                 |  22 ++-
  drivers/input/input.c          |  10 ++
  fs/Makefile                    |   2 +
- fs/exec.c                      |  68 ++++++++++
- fs/namei.c                     | 239 +++++++++++++++++++++++++++++++++
- fs/namespace.c                 | 297 +++++++++++++++++++++++++++++++++++++++++
- fs/notify/fdinfo.c             |  78 +++++++++++
+ fs/exec.c                      |  68 +++++++++
+ fs/namei.c                     | 239 ++++++++++++++++++++++++++++++
+ fs/namespace.c                 | 297 +++++++++++++++++++++++++++++++++++++
+ fs/notify/fdinfo.c             |  78 ++++++++++
  fs/open.c                      |  28 ++++
- fs/proc/base.c                 |  24 ++++
+ fs/proc/base.c                 |  24 +++
  fs/proc/bootconfig.c           |  13 ++
- fs/proc/fd.c                   |  70 ++++++++++
- fs/proc/task_mmu.c             |  69 +++++++++-
- fs/proc_namespace.c            | 174 ++++++++++++++++++++++++
+ fs/proc/fd.c                   |  70 +++++++++
+ fs/proc/task_mmu.c             |  69 ++++++++-
+ fs/proc_namespace.c            | 174 ++++++++++++++++++++++
  fs/read_write.c                |  10 ++
- fs/readdir.c                   | 119 +++++++++++++++++
- fs/stat.c                      |  89 ++++++++++++
- fs/statfs.c                    |  81 +++++++++++
- fs/super.c                     |  24 ++++
- kernel/kallsyms.c              |  31 +++++
+ fs/readdir.c                   | 119 +++++++++++++++
+ fs/stat.c                      |  89 +++++++++++
+ fs/statfs.c                    |  81 ++++++++++
+ fs/super.c                     |  24 +++
+ kernel/kallsyms.c              |  31 ++++
  kernel/reboot.c                |  12 ++
  kernel/sys.c                   |  28 ++++
  mm/memory.c                    |  13 ++
  security/selinux/avc.c         |  21 ++-
- security/selinux/hooks.c       | 173 +++++++++++++++++++++++-
- security/selinux/selinuxfs.c   | 137 +++++++++++++++++++
- security/selinux/ss/services.c | 257 +++++++++++++++++++++++++++++++++++
+ security/selinux/hooks.c       | 325 ++++++++++++++++++++++++++++++++++++++++-
+ security/selinux/selinuxfs.c   | 137 +++++++++++++++++
+ security/selinux/ss/services.c | 271 ++++++++++++++++++++++++++++++++++
  security/selinux/status.c      |  25 ++++
- 27 files changed, 2109 insertions(+), 5 deletions(-)
+ 27 files changed, 2275 insertions(+), 5 deletions(-)
 
 diff --git a/block/ioprio.c b/block/ioprio.c
 index 73301a261..a5fef0563 100644
@@ -2607,21 +2607,175 @@ index 29a9bf854..18456f388 100644
  	audit_log_format(ab, " tclass=%s", tclass);
  
 diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index fc926d3ca..0c92d3d35 100644
+index fc926d3ca..742d2bf99 100644
 --- a/security/selinux/hooks.c
 +++ b/security/selinux/hooks.c
-@@ -109,6 +109,10 @@
+@@ -109,6 +109,11 @@
  #define SELINUX_INODE_INIT_XATTRS 1
  
  struct selinux_state selinux_state;
 +#ifdef CONFIG_KSU_SUSFS
 +extern bool ksu_selinux_hide_running __read_mostly;
 +extern int susfs_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid, gfp_t gfp);
++extern int susfs_security_context_to_sid_force(const char *scontext, u32 scontext_len, u32 *sid);
 +#endif // #ifdef CONFIG_KSU_SUSFS
  
  /* SECMARK reference count */
  static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
-@@ -6594,6 +6598,170 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
+@@ -3337,6 +3342,152 @@ static void selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
+ 	spin_unlock(&isec->lock);
+ }
+ 
++#ifdef CONFIG_KSU_SUSFS
++static int susfs_selinux_inode_setxattr(struct mnt_idmap *idmap,
++				  struct dentry *dentry, const char *name,
++				  const void *value, size_t size, int flags)
++{
++	struct inode *inode = d_backing_inode(dentry);
++	struct inode_security_struct *isec;
++	struct superblock_security_struct *sbsec;
++	struct common_audit_data ad;
++	u32 newsid, sid = current_sid();
++	int rc = 0;
++
++	/* if not a selinux xattr, only check the ordinary setattr perm */
++	if (strcmp(name, XATTR_NAME_SELINUX))
++		return dentry_has_perm(current_cred(), dentry, FILE__SETATTR);
++
++	if (!selinux_initialized())
++		return (inode_owner_or_capable(idmap, inode) ? 0 : -EPERM);
++
++	sbsec = selinux_superblock(inode->i_sb);
++	if (!(sbsec->flags & SBLABEL_MNT))
++		return -EOPNOTSUPP;
++
++	if (!inode_owner_or_capable(idmap, inode))
++		return -EPERM;
++
++	ad.type = LSM_AUDIT_DATA_DENTRY;
++	ad.u.dentry = dentry;
++
++	isec = backing_inode_security(dentry);
++	rc = avc_has_perm(sid, isec->sid, isec->sclass,
++			  FILE__RELABELFROM, &ad);
++	if (rc)
++		return rc;
++
++	rc = susfs_security_context_to_sid(value, size, &newsid,
++				     GFP_KERNEL);
++	if (rc == -EINVAL) {
++		if (!has_cap_mac_admin(true)) {
++			struct audit_buffer *ab;
++			size_t audit_size;
++
++			/* We strip a nul only if it is at the end, otherwise the
++			 * context contains a nul and we should audit that */
++			if (value) {
++				const char *str = value;
++
++				if (str[size - 1] == '\0')
++					audit_size = size - 1;
++				else
++					audit_size = size;
++			} else {
++				audit_size = 0;
++			}
++			ab = audit_log_start(audit_context(),
++					     GFP_ATOMIC, AUDIT_SELINUX_ERR);
++			if (!ab)
++				return rc;
++			audit_log_format(ab, "op=setxattr invalid_context=");
++			audit_log_n_untrustedstring(ab, value, audit_size);
++			audit_log_end(ab);
++
++			return rc;
++		}
++		rc = susfs_security_context_to_sid_force(value,
++						   size, &newsid);
++	}
++	if (rc)
++		return rc;
++
++	rc = avc_has_perm(sid, newsid, isec->sclass,
++			  FILE__RELABELTO, &ad);
++	if (rc)
++		return rc;
++
++	rc = security_validate_transition(isec->sid, newsid,
++					  sid, isec->sclass);
++	if (rc)
++		return rc;
++
++	return avc_has_perm(newsid,
++			    sbsec->sid,
++			    SECCLASS_FILESYSTEM,
++			    FILESYSTEM__ASSOCIATE,
++			    &ad);
++}
++
++static void susfs_selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
++					const void *value, size_t size,
++					int flags)
++{
++	struct inode *inode = d_backing_inode(dentry);
++	struct inode_security_struct *isec;
++	u32 newsid;
++	int rc;
++
++	if (strcmp(name, XATTR_NAME_SELINUX)) {
++		/* Not an attribute we recognize, so nothing to do. */
++		return;
++	}
++
++	if (!selinux_initialized()) {
++		/* If we haven't even been initialized, then we can't validate
++		 * against a policy, so leave the label as invalid. It may
++		 * resolve to a valid label on the next revalidation try if
++		 * we've since initialized.
++		 */
++		return;
++	}
++
++	rc = susfs_security_context_to_sid_force(value, size,
++					   &newsid);
++	if (rc) {
++		pr_err("SELinux:  unable to map context to SID"
++		       "for (%s, %lu), rc=%d\n",
++		       inode->i_sb->s_id, inode->i_ino, -rc);
++		return;
++	}
++
++	isec = backing_inode_security(dentry);
++	spin_lock(&isec->lock);
++	isec->sclass = inode_mode_to_security_class(inode->i_mode);
++	isec->sid = newsid;
++	isec->initialized = LABEL_INITIALIZED;
++	spin_unlock(&isec->lock);
++}
++
++static int handle_selinux_inode_setxattr(struct mnt_idmap *idmap,
++				  struct dentry *dentry, const char *name,
++				  const void *value, size_t size, int flags)
++{
++	if ((likely(current_uid().val >= 10000 && ksu_selinux_hide_running)))
++		return susfs_selinux_inode_setxattr(idmap, dentry, name, value, size, flags);
++	return selinux_inode_setxattr(idmap, dentry, name, value, size, flags);
++}
++
++static void handle_selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
++					const void *value, size_t size,
++					int flags)
++{
++	if ((likely(current_uid().val >= 10000 && ksu_selinux_hide_running)))
++		return susfs_selinux_inode_post_setxattr(dentry, name, value, size, flags);
++	return selinux_inode_post_setxattr(dentry, name, value, size, flags);
++}
++#endif // #ifdef CONFIG_KSU_SUSFS
++
+ static int selinux_inode_getxattr(struct dentry *dentry, const char *name)
+ {
+ 	const struct cred *cred = current_cred();
+@@ -6594,6 +6745,170 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
  	return -EINVAL;
  }
  
@@ -2792,7 +2946,21 @@ index fc926d3ca..0c92d3d35 100644
  static int selinux_ismaclabel(const char *name)
  {
  	return (strcmp(name, XATTR_SELINUX_SUFFIX) == 0);
-@@ -7224,8 +7392,11 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
+@@ -7144,8 +7459,13 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
+ 	LSM_HOOK_INIT(inode_setattr, selinux_inode_setattr),
+ 	LSM_HOOK_INIT(inode_getattr, selinux_inode_getattr),
+ 	LSM_HOOK_INIT(inode_xattr_skipcap, selinux_inode_xattr_skipcap),
++#ifdef CONFIG_KSU_SUSFS
++	LSM_HOOK_INIT(inode_setxattr, handle_selinux_inode_setxattr),
++	LSM_HOOK_INIT(inode_post_setxattr, handle_selinux_inode_post_setxattr),
++#else
+ 	LSM_HOOK_INIT(inode_setxattr, selinux_inode_setxattr),
+ 	LSM_HOOK_INIT(inode_post_setxattr, selinux_inode_post_setxattr),
++#endif // #ifdef CONFIG_KSU_SUSFS
+ 	LSM_HOOK_INIT(inode_getxattr, selinux_inode_getxattr),
+ 	LSM_HOOK_INIT(inode_listxattr, selinux_inode_listxattr),
+ 	LSM_HOOK_INIT(inode_removexattr, selinux_inode_removexattr),
+@@ -7224,8 +7544,11 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
  	LSM_HOOK_INIT(getselfattr, selinux_getselfattr),
  	LSM_HOOK_INIT(setselfattr, selinux_setselfattr),
  	LSM_HOOK_INIT(getprocattr, selinux_getprocattr),
@@ -2999,7 +3167,7 @@ index 8acbaa4f2..e2a1c06bf 100644
  {
  	char *scon = NULL, *tcon = NULL;
 diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
-index 45a4f7a20..88c4b07be 100644
+index 45a4f7a20..c1b6596a9 100644
 --- a/security/selinux/ss/services.c
 +++ b/security/selinux/ss/services.c
 @@ -70,6 +70,13 @@
@@ -3059,7 +3227,7 @@ index 45a4f7a20..88c4b07be 100644
  	seqno = newpolicy->latest_granting;
  
  	/* Install the new policy */
-@@ -4020,3 +4049,231 @@ int security_read_state_kernel(void **data, size_t *len)
+@@ -4020,3 +4049,245 @@ int security_read_state_kernel(void **data, size_t *len)
  	}
  	return err;
  }
@@ -3235,6 +3403,20 @@ index 45a4f7a20..88c4b07be 100644
 +{
 +	return susfs_security_context_to_sid(scontext, strlen(scontext),
 +				       sid, gfp);
++}
++
++int susfs_security_context_to_sid_default(const char *scontext, u32 scontext_len,
++				    u32 *sid, u32 def_sid, gfp_t gfp_flags)
++{
++	return susfs_security_context_to_sid_core(scontext, scontext_len,
++					    sid, def_sid, gfp_flags, 1);
++}
++
++int susfs_security_context_to_sid_force(const char *scontext, u32 scontext_len,
++				  u32 *sid)
++{
++	return susfs_security_context_to_sid_core(scontext, scontext_len,
++					    sid, SECSID_NULL, GFP_KERNEL, 1);
 +}
 +
 +void susfs_security_compute_av_user(u32 ssid,
